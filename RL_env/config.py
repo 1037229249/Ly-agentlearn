@@ -22,3 +22,12 @@ CLOUD_GPU = 128.0  # 云节点GPU数量
 # 物理链路通信配置
 BANDWIDTH_RANGE = (50.0, 100.0)  # 链路带宽范围（Mbps）
 LATENCY_RANGE = (0.2, 2.0)  # 链路延迟范围（ms）
+
+# 服务实体与动作空间配置
+NUM_MICROSERVICES = 20  # 微服务的种类数量
+NUM_AI_SERVICES = 4  # AI服务种类数量
+NUM_SERVICES = NUM_MICROSERVICES + NUM_AI_SERVICES  # 总服务种类数量
+
+# 部署动作空间约束
+MAX_INSTANCES = 5  # 每个服务在单一节点的最大实例数
+INVALID_ACTION_PENALTY = -100.0  # 智能体选择非法部署动作时的惩罚分数
