@@ -1,7 +1,9 @@
 """
-文件作用：基于 Gymnasium 的强化学习环境主入口。
-核心改造点：彻底摒弃一维扁平状态，定义结构化的 Dict Observation Space，
-分离宏观资源拓扑状态（支持 GNN）与微观服务分布状态。
+文件作用：基于 Gymnasium 的强化学习环境主入口（双时间尺度架构的 Macro-step 层）。
+核心改造点：
+1. 彻底摒弃一维扁平状态，采用 Dict 异构张量空间。
+2. 动作空间改为相对增减指令（-1, 0, +1）。
+3. 引入 Action Masking (动作掩码) 机制，从底层屏蔽资源越界与非法架构部署，终结暴力试错。
 """
 import gymnasium as gym
 from gymnasium import spaces
@@ -33,8 +35,7 @@ class HybridOrchestrationEnv(gym.Env):
             # 第一维的大小为节点数量（NUM_NODES），第二维的大小为 3，分别对应 CPU、GPU 和内存三个资源维度，dtype=np.float32 表示这个空间中的数据类型为 32 位浮点数。
             # 宏观节点特征：归一化后的资源利用率 (NUM_NODES, 3)
             "macro_node_features": spaces.Box(
-                low=0, 
-                high=np.inf, 
+                low=0, high=1.0, 
                 shape=(config.NUM_NODES, 3), 
                 dtype=np.float32
             ),
@@ -54,17 +55,14 @@ class HybridOrchestrationEnv(gym.Env):
             )
         })
         # ================= 动作空间 (Action Space) 定义 =================
-        # 每一步智能体具体的部署动作是：一个长度为 NUM_NODES * NUM_SERVICES 的一维整数数组，表示每个服务在每个节点上部署的实例数量。
-        # 矩阵原始维度应为 (NUM_NODES, NUM_SERVICES)，但 Gym 的 MultiDiscrete 要求传入一维数组。
-        # 因此我们把容量为 (MAX_INSTANCES + 1) 的数组重复 NUM_NODES * NUM_SERVICES 次。
-        # 比如MAX_INSTANCES=5，则每个维度的可选离散动作是 0,1,2,3,4,5 (即容量为6)
+        # 动作空间解耦为离散的增减指令 (0: 缩容, 1: 保持, 2: 扩容)
+        # action_dim 的计算方式是每个节点（NUM_NODES）对每个服务（NUM_SERVICES）都可以执行一个动作
+        # 因此总的动作维度是 NUM_NODES * NUM_SERVICES。
         action_dim = self_num_nodes * self_num_services
-        # spaces.MultiDiscrete 接受一个数组，数组每个元素代表该维度允许的离散选择数量
-        # np.full()函数用于创建一个指定形状的数组，并用指定的值填充这个数组。
-        # 创建了一个长度为 action_dim 的一维数组，每个元素的值都是 (config.MAX_INSTANCES + 1)
-        # 表示每个服务在每个节点上可以部署的实例数量从 0 到 MAX_INSTANCES。
+        # spaces.MultiDiscrete 是 Gym 中用于定义多离散空间的类，表示一个由多个离散空间组成的空间，每个离散空间都有自己的取值范围。
+        # np.full作用创建一个长度为 action_dim 的数组，数组中的每个元素都被设置为 config.DEPLOY_ACTION_DIM（即 3）。
         self.action_space = spaces.MultiDiscrete(
-            np.full(action_dim, config.MAX_INSTANCES + 1, dtype=np.int32)
+            np.full(action_dim, config.DEPLOY_ACTION_DIM, dtype=np.int32)
         )
 
         # 用于跟踪当前服务部署情况的内部状态变量，初始为全零矩阵，维度为 (NUM_NODES, NUM_SERVICES)
@@ -95,56 +93,93 @@ class HybridOrchestrationEnv(gym.Env):
         info = {}
         return obs, info
     
+    def action_masks(self):
+        """
+        动态掩码生成器
+        作用：为 Stable-Baselines3-Contrib 的 MaskablePPO 提供接口。
+        返回：一维布尔数组，屏蔽物理上绝对不可行的动作，让神经网络 100% 只在合法域内探索。
+        """
+        # 初始化掩码：维度为 (节点数, 服务数, 3种动作)，默认全部合法 (True)
+        # np.ones 函数的作用是创建一个指定形状的数组，并用 1 填充。
+        # 这里创建了一个形状为 (NUM_NODES, NUM_SERVICES, DEPLOY_ACTION_DIM) 的三维数组，所有元素都被初始化为 1（即 True），表示初始状态下所有动作都是合法的。
+        mask = np.ones((config.NUM_NODES, config.NUM_SERVICES, config.DEPLOY_ACTION_DIM), dtype=bool)
+        # 遍历每个节点和服务，检查每种动作的合法性
+        for n in range(config.NUM_NODES):
+            for s in range(config.NUM_SERVICES):
+                current_instances = self.current_distribution[n, s]
+                req = self.service_registry.service_req_matrix[s]  # 获取服务 s 的资源需求向量 [CPU, GPU, MEM]
+                # ----- 动作 0: 缩容 (-1) -----
+                # 限制：如果当前实例数小于等于 0，则禁止再缩容
+                if current_instances <= 0:
+                    mask[n, s, 0] = False  # 禁止缩容动作
+                # ----- 动作 1: 保持 (0) -----
+                # 限制：保持动作通常总是合法的，因为它不改变部署状态，所以这里不做特殊处理，保持为 True。
+                # ----- 动作 2: 扩容 (+1) -----
+                # 限制 A: 如果当前实例数已经达到单节点最大实例数上限，则禁止扩容
+                if current_instances >= config.MAX_INSTANCES:
+                    mask[n, s, 2] = False  # 禁止扩容动作
+                else:
+                    # 限制 B: 物理剩余资源必须能够容纳该服务单实例的资源需求
+                    if np.any(self.physical_net.remain_matrix[n] < req):
+                        mask[n, s, 2] = False  # 禁止扩容动作
+                    # 限制 C：架构限制(例如 Full-size AI 只能部署在云端 Node 0)
+                    # 假设 config.NUM_MICROSERVICES 对应的是第一个 AI 服务 (Full-size)
+                    if s == config.NUM_MICROSERVICES and n != 0:
+                        mask[n, s, 2] = False  # 禁止在非云节点扩容 Full-size AI 服务
+
+        # SB3 的 MaskablePPO 针对 MultiDiscrete 要求返回展开的 1D 布尔数组
+        # mask 的原始形状是 (NUM_NODES, NUM_SERVICES, DEPLOY_ACTION_DIM)
+        # flatten() 方法将这个三维数组展平为一维数组，长度为 NUM_NODES * NUM_SERVICES * DEPLOY_ACTION_DIM
+        # 每个元素对应一个具体的动作是否合法。
+        return mask.flatten()
+
     def step(self, action):
         """
-        这里的 step 方法是 Gym 环境中的另一个核心方法，用于执行一个动作并返回环境的下一个状态、奖励、是否结束以及额外信息。
-        参数 action 是智能体选择的动作，通常是一个表示调度决策的向量或矩阵。
-        这个方法需要根据 action 来更新环境的状态，并计算奖励和是否结束的标志。
-        核心步骤：接收动作 -> 形状重塑 -> 矩阵运算算消耗 -> 检查约束 -> 状态转移
+        双时间尺度中的宏观时间步 (Macro-step Deploy)
         """
-        # 1. 动作重塑：将一维长度为 N*S 的动作数组，恢复为 (NUM_NODES, NUM_SERVICES) 的二维矩阵
-        N_matrix = action.reshape((config.NUM_NODES, config.NUM_SERVICES))
+        # 1. 动作解码：将 0/1/2 映射为真实的实例变动量 -1/0/+1
+        # action 是长度为 N*S 的 1D 数组，转为 (N, S) 矩阵，再整体减 1
+        action_matrix = action.reshape((config.NUM_NODES, config.NUM_SERVICES))
+        delta_matrix = action_matrix - 1  # 将 0/1/2 转换为 -1/0/+1 的增减指令
+        
+        # 2. 计算转移后的微观服务分布状态
+        N_matrix = self.current_distribution + delta_matrix  # 计算新的实例分布矩阵
 
-        # 2. 矩阵化资源计算
-        # N_matrix 维度 (Nodes, Services) 点乘 service_req_matrix 维度 (Services, 3) 
-        # 结果维度必为 (Nodes, 3)，代表每个物理节点在 [CPU, GPU, MEM] 上的综合消耗量
-        # mp.dot()函数用于执行矩阵乘法，计算每个节点的资源消耗总量。
-        # N_matrix表示每个节点上部署的服务实例数量，service_req_matrix表示每个服务实例的资源需求。
-        consumed_resources = np.dot(N_matrix, self.service_registry.service_req_matrix)
+        # [安全网] 理论上有 Action Masking 不应发生越界，出现越界要报异常
+        if np.any(N_matrix < 0) or np.any(N_matrix > config.MAX_INSTANCES):
+            raise ValueError("Action leads to invalid instance count! Check action masking logic.")
+        
+        N_matrix = np.clip(N_matrix, 0, config.MAX_INSTANCES)  # 确保实例数在合法范围内
 
-        # 3. 硬件约束校验：判断任何节点的消耗是否大过了它的最大物理容量
-        # (使用 np.any() 如果有任何一个 True，说明存在越界)
-        is_invalid_action = np.any(consumed_resources > self.physical_net.capacity_matrix)
+        # 3. 矩阵化资源计算 (运用 Einsum 或 dot 实现高维张量乘法)
+        # N_matrix (Nodes, Services) 点乘 service_req_matrix (Services, 3) -> (Nodes, 3)
+        # 具体理解：N_matrix 中的每个元素 N_matrix[n, s] 表示节点 n 上服务 s 的实例数量，service_req_matrix 中的每行表示一个服务的资源需求向量 [CPU, GPU, MEM]。
+        consumed_resources = np.dot(N_matrix, self.service_registry.service_req_matrix) 
 
-        # 设定强化学习的默认变量
-        reward = 0.0
+        # 硬件约束严密校验
+        is_invalid_action = np.any(consumed_resources > self.physical_net.remain_matrix)
+
+        reward = 0
         terminated = False
         info = {}
 
         if is_invalid_action:
-            # 【非法动作分支】
-            reward = config.INVALID_ACTION_PENALTY  # 极大负向奖励
-            terminated = True  # 强制结束回合
-            #"violation_count" 键的值为 1，表示发生了一次违规行为，这个信息可以在训练过程中通过 Tensorboard 等工具进行监控和分析。
-            info["violation_count"] = 1 # 在 info 字典中记录违规，方便日后通过 Tensorboard 监控
+            # 在有 Mask 的情况下，这个分支理论上不应该被触达，如果触达说明 Mask 机制失效了，直接报错暴露问题。
+            reward = config.INVALID_ACTION_PENALTY
+            terminated = True
+            info["violation_count"] = 1
+            info["error_msg"] = "Mask bypass detected!"
         else:
-            # 【合法动作分支】
-            # 部署有效，执行资源扣减，更新物理环境当前可用资源
-            self.physical_net.remain_matrix = self.physical_net.capacity_matrix - consumed_resources
-            # 当前current_distribution 直接更新为 N_matrix，表示当前的服务部署状态完全由智能体的动作决定
-            self.current_distribution = np.copy(N_matrix)
-
-            # 此刻由于我们还没做延迟计算，合法部署暂时给 0 分
-            reward = 0.0
-            # 正常跑完当前 step，回合继续
-            terminated = False
+            # 状态合法，正式更新环境状态
+            # remain_matrix等于
+            self.physical_net.remain_matrix = self.physical_net.capacity_matrix - consumed_resources  # 更新剩余资源矩阵
+            self.current_distribution = np.copy(N_matrix)  # 更新当前服务分布状态
             info["violation_count"] = 0
-
-        # 4. 构建下一时刻返回的观测状态 (Observation)
+        
         obs = {
-            "macro_node_features": self.physical_net.get_utilization_matrix(),  # 当前节点资源利用率矩阵 (NUM_NODES, 3)
-            "macro_edge_features": np.copy(self.physical_net.edge_features),  # 当前边
-            "micro_service_distribution": np.copy(self.current_distribution)  # 当前服务分布矩阵 (NUM_NODES, NUM_SERVICES)
+            "macro_node_features": self.physical_net.get_utilization_matrix(),  # 更新后的节点资源利用率矩阵
+            "macro_edge_features": np.copy(self.physical_net.edge_features),  # 边特征保持不变
+            "micro_service_distribution": np.copy(self.current_distribution)  # 更新后的服务分布矩阵
         }
 
         # 按照 Gymnasium 最新 API 规范，返回五元组：obs, reward, terminated, truncated, info
