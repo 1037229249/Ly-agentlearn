@@ -29,7 +29,7 @@ class DynamicTrafficGenerator:
         self.active_flows = []
         for f in range(self.num_flows):
             # 随机决定该流的链条长度
-            chain_length = np.random.randint(config.MIN_CHAIN_LENGTH, config.NUM_SERVICES + 1)
+            chain_length = np.random.randint(config.MIN_CHAIN_LENGTH, config.MAX_CHAIN_LENGTH + 1)
 
             # 随机挑选服务组装为调用链 (DAG的线性退化形态)
             # 保证业务流一定包含微服务（前排）和 AI 服务（核心）
@@ -58,15 +58,27 @@ class DynamicTrafficGenerator:
             })
     
     def _init_data_dependencies(self):
+        """初始化服务间传输的依赖数据量 (MB)"""
+        for flow in self.active_flows:
+            chain = flow['chain']
+            # 遍历链上的相邻服务节点，分配通信载荷
+            for i in range(len(chain) - 1):
+                s_p = chain[i]
+                s_q = chain[i + 1]
+                if self.data_dep_matrix[s_p, s_q] == 0:
+                    # 随机分配 1~10 MB 的数据依赖量
+                    self.data_dep_matrix[s_p, s_q] = np.random.uniform(1.0, config.MAX_DATA_MB)
+        
+    def step_traffic(self):
         """
         模拟潮汐效应，更新请求到达率。
         在仿真的不同时间步调用，使网络处于动态波动中。
         """
         for flow in self.active_flows:
             # 加入随机游走噪音
-            delta = np.random.uniform(-5.0, 5.0)  # 每次调整的幅度在 -50 到 50 req/s 之间
+            delta = np.random.normal(0, 50.0)
             new_lambda = flow['lambda'] + delta
-            # 确保新的到达率不超过预设的最大值
+            # 防止到达率突破上下限
             flow['lambda'] = np.clip(new_lambda, 10.0, config.MAX_ARRIVAL_RATE)
 
 class HeuristicRouter:
@@ -168,7 +180,7 @@ class HeuristicRouter:
                 if prev_s is not None:
                     # current_lambda[:, np.newaxis] 将 (V,) 竖起变为 (V, 1)，与 (V, V) 广播相乘
                     F_step = (current_lambda[:, np.newaxis] * P_tensor[s]) # 形状 (V, V)，表示从每个来源节点 i 到每个目标节点 j 的流量强度
-                    F_tensor[s] += F_step
+                    F_tensor[prev_s] += F_step
 
                 # 流量向前推进，当前服务执行完后，驻留量变为进入下一跳的出发量
                 current_lambda = next_lambda

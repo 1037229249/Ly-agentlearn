@@ -57,10 +57,18 @@ class PhysicalNetworkGraph:
         #fill_diagonal函数将矩阵的对角线元素设置为指定值，第一个参数是要修改的矩阵，第二个参数是要设置的值，np.inf表示无穷大
         np.fill_diagonal(self.edge_features[:,:,0], np.inf)
 
-        #填充通道1：延迟矩阵
+        # 填充通道1：分层延迟矩阵
+        # 1. 首先填充所有节点间的基础延迟为边缘局域网延迟
         self.edge_features[:,:,1] = np.random.uniform(
-            config.LATENCY_RANGE[0], config.LATENCY_RANGE[1], 
+            config.EDGE_LATENCY_RANGE[0], config.EDGE_LATENCY_RANGE[1], 
             size=(self.num_nodes, self.num_nodes)).astype(np.float32)
+        # 2. 覆盖云节点 (索引0) 与所有边缘节点之间的广域网通信延迟
+        cloud_latencies = np.random.uniform(
+            config.CLOUD_LATENCY_RANGE[0], config.CLOUD_LATENCY_RANGE[1], 
+            size=self.num_nodes).astype(np.float32)
+        # [0, j, 1] 表示云节点到第 j 个节点的延迟，[i, 0, 1] 表示第 i 个节点到云节点的延迟
+        self.edge_features[0,:,1] = cloud_latencies  # 云节点到所有节点的延迟
+        self.edge_features[:,0,1] = cloud_latencies  # 所有节点到云节点的延迟
         
         #同一节点内延迟设置为0，表示不产生传播延迟
         np.fill_diagonal(self.edge_features[:,:,1], 0.0)
