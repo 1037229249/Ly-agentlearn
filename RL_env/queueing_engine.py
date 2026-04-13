@@ -58,5 +58,68 @@ class QueueingEngine:
         计算 AI 服务 (M/M/1) 批处理延迟矩阵。
         输入维度：Lambda, Mu, C 均为 (NUM_NODES, NUM_AI_SERVICES)
         """
+        C_float = C.astype(np.float32)  # 将实例数矩阵转换为浮点数类型，便于后续计算
+        # 避免除零异常
+        C_safe = np.where(C == 0, 1e-9, C_float)
 
-        
+        # 请求均匀分布到每个实例上，计算每个实例的请求到达率
+        lambda_inst = Lamda / C_safe  # 每个实例的请求到达率
+
+        # 稳定性约束
+        mask_overload = (lambda_inst >= Mu) | (C == 0)  # 当每个实例的请求到达率大于等于处理速率或实例数为0时，系统处于过载状态
+
+        Mu_safe = np.where(mask_overload, 1, Mu)
+        lambda_inst_safe = np.where(mask_overload, 0.0, lambda_inst) 
+
+        # M/M/1 期望延迟计算公式：D = 1 / (Mu - lambda_inst)
+        delay = 1.0 / (Mu_safe - lambda_inst_safe)
+        # where 作用：当 mask_overload 条件为 True 时，返回 config.MAX_DELAY_MS；否则返回计算得到的 delay 值。这确保了在系统过载或无实例的情况下，延迟被设置为一个非常大的数，表示系统崩溃。
+        return np.where(mask_overload, config.MAX_DELAY_MS, delay)  
+    
+    @staticmethod
+    # 参数说明：traffic_bytes_tensor 是一个形状为 (NUM_NODES, NUM_NODES) 的张量，表示每对节点之间的流量大小（以字节为单位）。
+    # physical_net 是一个包含网络拓扑信息的对象，能够提供节点之间的物理距离或带宽等信息。
+    def calc_comm_delay_matrix(traffic_bytes_tensor, physical_net):
+        """计算全网链路的通信延迟矩阵 (NUM_NODES, NUM_NODES)"""
+        B_matrix = physical_net.edge_features[:,:,0]  # 提取带宽矩阵 B_{i,j}
+        D_matrix = physical_net.edge_features[:,:,1]  # 提取物理延迟矩阵 d_{i,j}
+
+        # 简化计算：MB * 8 / Mbps = 秒 -> 换算为 ms
+        # 实际工程中需注意单位：1 MB = 8 Mbits
+        transmission_delay = (traffic_bytes_tensor * 8.0) / np.where(B_matrix == 0, 1e-9, B_matrix)
+        return transmission_delay + D_matrix
+
+    @staticmethod
+    def calculate_end_to_end_delay(traffic_generator, P_tensor, node_delays, comm_delay_matrix) :
+        """基于路由概率矩阵与有向无环图，计算每条流的端到端加权期望延迟"""
+        expected_delays = []
+
+        for flow in traffic_generator.active_flows:
+            chain = flow['chain']
+            start_node = flow['start_node']
+
+            # 使用概率分布向量在图谱中游走
+            current_prob = np.zeros(config.NUM_NODES, dtype=np.float32)
+            current_prob[start_node] = 1.0  # 从起始节点开始，概率为 1
+
+            flow_delay = 0.0
+            pre_s = None
+
+            for s in chain:
+                # 累加节点（处理+排队）延迟期望
+                flow_delay += np.sum(current_prob * node_delays[:, s])
+
+                # 累加跨节点通信延迟期望
+                if pre_s is not None:
+                    step_comm_delay = np.sum(
+                        current_prob[:, np.newaxis] * P_tensor[pre_s] * comm_delay_matrix
+                                             )
+                    flow_delay += step_comm_delay
+
+                # 马尔可夫状态转移至下一跳
+                current_prob = current_prob @ P_tensor[s]
+                pre_s = s
+            
+            expected_delays.append(flow_delay)
+
+        return np.array(expected_delays, dtype=np.float32)

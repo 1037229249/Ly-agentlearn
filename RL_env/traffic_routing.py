@@ -157,6 +157,10 @@ class HeuristicRouter:
         # F_tensor[s, i, j] 代表：为了执行服务 s，从节点 i 转发至节点 j 的流量强度 (req/s)，用于后续计算通信延迟和链路负载。
         F_tensor = np.zeros((config.NUM_SERVICES, config.NUM_NODES, config.NUM_NODES), dtype=np.float32)
 
+        # 初始化物理链路数据传输负荷矩阵 (单位: MB/s)
+        # 用于后续计算带宽占用与传输延迟。
+        traffic_bytes_tensor = np.zeros((config.NUM_NODES, config.NUM_NODES), dtype=np.float32)
+
         # 遍历每一条动态生成的调用流进行链路推导
         for flow in traffic_generator.active_flows:
             chain = flow['chain']
@@ -178,13 +182,20 @@ class HeuristicRouter:
 
                 # 若存在前驱节点，则计算跨越物理链路产生的数据交换量 F_step
                 if prev_s is not None:
+                    # 计算从节点 i 到节点 j 的特定服务流量强度 (req/s)
                     # current_lambda[:, np.newaxis] 将 (V,) 竖起变为 (V, 1)，与 (V, V) 广播相乘
                     F_step = (current_lambda[:, np.newaxis] * P_tensor[s]) # 形状 (V, V)，表示从每个来源节点 i 到每个目标节点 j 的流量强度
+                    # 更新流量强度张量 (保持 req/s 维度)
                     F_tensor[prev_s] += F_step
+
+                    # 提取依赖数据量，计算物理链路的 MB/s 负荷
+                    data_mb = traffic_generator.data_dep_matrix[prev_s, s]
+                    traffic_bytes_tensor += F_step * data_mb
+
 
                 # 流量向前推进，当前服务执行完后，驻留量变为进入下一跳的出发量
                 current_lambda = next_lambda
                 prev_s = s
         # 返回聚合到达率、通信流量矩阵与概率图谱
         
-        return lambda_agg, F_tensor, P_tensor
+        return lambda_agg, F_tensor,traffic_bytes_tensor, P_tensor
