@@ -83,3 +83,8 @@ COST_MICROSERVICE = 0.1   # 微服务单实例成本
 COST_AI_LIGHT = 2.0       # 轻量级 AI 单实例成本
 COST_AI_FULL = 10.0       # 全量级 AI 单实例成本
 COST_NODE_ACTIVE = 1.0    # 边缘节点激活(开机且托管了实例)的基础固定成本
+
+# ================= Wrapper 归一化极值基准 =================
+# 用于将宏观拓扑的带宽与延迟强行压缩至 [0.0, 1.0] 区间，防止神经网络梯度爆炸
+MAX_NORM_BANDWIDTH = BANDWIDTH_RANGE[1]  # 100 Mbps
+MAX_NORM_LATENCY = 100.0 # 设定一个安全的全局最大延迟归一化分母 (ms)
