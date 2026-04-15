@@ -12,6 +12,10 @@ import config
 from topology_graph import PhysicalNetworkGraph
 from services import ServiceRegistry
 
+from traffic_routing import DynamicTrafficGenerator, HeuristicRouter
+from queueing_engine import QueueingEngine
+from reward_evaluator import RewardEvaluator
+
 #这里HybridOrchestrationEnv 是一个强化学习环境类，继承自 gym.Env，表示一个混合编排环境。
 class HybridOrchestrationEnv(gym.Env):
     def __init__(self):
@@ -21,6 +25,11 @@ class HybridOrchestrationEnv(gym.Env):
         self.physical_net = PhysicalNetworkGraph()
         # 生成服务资源需求矩阵
         self.service_registry = ServiceRegistry()
+
+        # 挂载路由、流量与奖励评估引擎 ===
+        self.traffic_gen = DynamicTrafficGenerator()
+        self.router = HeuristicRouter(self.physical_net)
+        self.reward_evaluator = RewardEvaluator()
 
         self_num_nodes = config.NUM_NODES
         self_num_services = config.NUM_SERVICES
@@ -67,6 +76,32 @@ class HybridOrchestrationEnv(gym.Env):
 
         # 用于跟踪当前服务部署情况的内部状态变量，初始为全零矩阵，维度为 (NUM_NODES, NUM_SERVICES)
         self.current_distribution = np.zeros((config.NUM_NODES, config.NUM_SERVICES), dtype=np.int32)
+        
+        # ================= 生成异构处理速率矩阵 Mu_matrix =================
+        # 维度: (NUM_NODES, NUM_SERVICES)
+        # 物理意义：不同的硬件节点执行同一个服务，其基准处理速率是不一样的
+        self.Mu_matrix = np.zeros((config.NUM_NODES, config.NUM_SERVICES), dtype=np.float32)
+        # 1. 边缘节点（索引 1 到末尾）的异构算力波动
+        edge_nodes_count = config.NUM_NODES - 1
+
+        # 为每个边缘节点的每个微服务生成随机的处理速率
+        self.Mu_matrix[1:, :config.NUM_MICROSERVICES] = np.random.uniform(
+            config.MICROSERVICE_MU_RANGE[0], 
+            config.MICROSERVICE_MU_RANGE[1], 
+            size=(edge_nodes_count, config.NUM_MICROSERVICES)
+        )
+        
+        # 为每个边缘节点的每个 AI 服务生成随机的处理速率
+        self.Mu_matrix[1:, config.NUM_MICROSERVICES:] = np.random.uniform(
+            config.AI_SERVICE_MU_RANGE[0], 
+            config.AI_SERVICE_MU_RANGE[1], 
+            size=(edge_nodes_count, config.NUM_AI_SERVICES)
+        )
+
+        # 2. 云端节点（索引 0）
+        # 云节点配备了顶级 CPU 和 GPU 集群，处理速率应远高于边缘节点的上限
+        self.Mu_matrix[0, :config.NUM_MICROSERVICES] = config.MICROSERVICE_MU_RANGE[1] * config.CLOUD_MU_MULTIPLIER
+        self.Mu_matrix[0, config.NUM_MICROSERVICES:] = config.AI_SERVICE_MU_RANGE[1] * config.CLOUD_MU_MULTIPLIER
 
     def reset(self, seed=None, options=None):
         """
@@ -83,10 +118,24 @@ class HybridOrchestrationEnv(gym.Env):
         # 清空全网所有的实例部署
         self.current_distribution.fill(0)
 
+        # 重置流量链
+        self.traffic_gen._generate_service_chains()
+
+        # 每次环境重置时，让边缘节点的算力发生微小波动（模拟真实环境中硬件的老化、超频或降频）
+        # 这会迫使智能体根据观察到的系统延迟去"猜"当前节点的算力，而不是死记硬背
+        self.Mu_matrix[1:, :config.NUM_MICROSERVICES] = np.random.uniform(
+            config.MICROSERVICE_MU_RANGE[0], config.MICROSERVICE_MU_RANGE[1], 
+            size=(config.NUM_NODES - 1, config.NUM_MICROSERVICES)
+        )
+        self.Mu_matrix[1:, config.NUM_MICROSERVICES:] = np.random.uniform(
+            config.AI_SERVICE_MU_RANGE[0], config.AI_SERVICE_MU_RANGE[1], 
+            size=(config.NUM_NODES - 1, config.NUM_AI_SERVICES)
+        )
+
         # 构建符合 observation_space 定义的状态字典
         obs = {
             "macro_node_features": self.physical_net.get_utilization_matrix(),  # 当前节点资源利用率矩阵 (NUM_NODES, 3)
-            "macro_edge_features": np.copy(self.physical_net.edge_features),  # 当前边
+            "macro_edge_features": np.copy(self.physical_net.edge_features),  # 当前边特征张量 (NUM_NODES, NUM_NODES, 2)
             "micro_service_distribution": np.copy(self.current_distribution)  # 当前服务分布矩阵 (NUM_NODES, NUM_SERVICES)
         }
         # 返回状态 obs 和一个空的 info 字典（预留给后续记录方差、成本等额外指标）
@@ -143,45 +192,75 @@ class HybridOrchestrationEnv(gym.Env):
         delta_matrix = action_matrix - 1  # 将 0/1/2 转换为 -1/0/+1 的增减指令
         
         # 2. 计算转移后的微观服务分布状态
-        N_matrix = self.current_distribution + delta_matrix  # 计算新的实例分布矩阵
+        N_matrix_current = self.current_distribution + delta_matrix  # 计算新的实例分布矩阵
 
         # [安全网] 理论上有 Action Masking 不应发生越界，出现越界要报异常
-        if np.any(N_matrix < 0) or np.any(N_matrix > config.MAX_INSTANCES):
+        if np.any(N_matrix_current < 0) or np.any(N_matrix_current > config.MAX_INSTANCES):
             raise ValueError("Action leads to invalid instance count! Check action masking logic.")
         
-        N_matrix = np.clip(N_matrix, 0, config.MAX_INSTANCES)  # 确保实例数在合法范围内
+        N_matrix_current = np.clip(N_matrix_current, 0, config.MAX_INSTANCES)  # 确保实例数在合法范围内
 
         # 3. 矩阵化资源计算 (运用 Einsum 或 dot 实现高维张量乘法)
         # N_matrix (Nodes, Services) 点乘 service_req_matrix (Services, 3) -> (Nodes, 3)
         # 具体理解：N_matrix 中的每个元素 N_matrix[n, s] 表示节点 n 上服务 s 的实例数量，service_req_matrix 中的每行表示一个服务的资源需求向量 [CPU, GPU, MEM]。
-        consumed_resources = np.dot(N_matrix, self.service_registry.service_req_matrix) 
+        consumed_resources = np.dot(N_matrix_current, self.service_registry.service_req_matrix) 
 
         # 硬件约束严密校验
         is_invalid_action = np.any(consumed_resources > self.physical_net.remain_matrix)
 
-        reward = 0
-        terminated = False
-        info = {}
-
         if is_invalid_action:
-            # 在有 Mask 的情况下，这个分支理论上不应该被触达，如果触达说明 Mask 机制失效了，直接报错暴露问题。
-            reward = config.INVALID_ACTION_PENALTY
-            terminated = True
-            info["violation_count"] = 1
-            info["error_msg"] = "Mask bypass detected!"
-        else:
-            # 状态合法，正式更新环境状态
-            # remain_matrix等于
-            self.physical_net.remain_matrix = self.physical_net.capacity_matrix - consumed_resources  # 更新剩余资源矩阵
-            self.current_distribution = np.copy(N_matrix)  # 更新当前服务分布状态
-            info["violation_count"] = 0
+            # 越界惩罚
+            obs = {
+                "macro_node_features": self.physical_net.get_utilization_matrix(),  # 更新后的节点资源利用率矩阵
+                "macro_edge_features": np.copy(self.physical_net.edge_features),  # 边特征保持不变
+                "micro_service_distribution": np.copy(self.current_distribution)  # 更新后的服务分布矩阵
+            }
+            return obs, config.INVALID_ACTION_PENALTY, True, False, {"error_msg": "Mask bypass!"}
+
+        # 更新物理基座状态
+        self.physical_net.remain_matrix = self.physical_net.capacity_matrix - consumed_resources  # 更新剩余资源矩阵
+        # ================= 调用底层引擎链路 =================
+        # A. 更新网络流量环境
+        self.traffic_gen.step_traffic()
+
+        # B. 调用路由引擎推演分布
+        lambda_agg, F_tensor, traffic_bytes, P_tensor = self.router.step_route(N_matrix_current, self.traffic_gen)
+
+        # C. 排队论引擎计算节点延迟 (区分微服务和AI服务)
+        lambda_micro = lambda_agg[:, :config.NUM_MICROSERVICES]
+        mu_micro = self.Mu_matrix[:, :config.NUM_MICROSERVICES]
+        c_micro = N_matrix_current[:, :config.NUM_MICROSERVICES]
+        delay_micro = QueueingEngine.calc_mmc_delay_tensor(lambda_micro, mu_micro, c_micro)
+
+        lambda_ai = lambda_agg[:, config.NUM_MICROSERVICES:]
+        mu_ai = self.Mu_matrix[:, config.NUM_MICROSERVICES:]
+        c_ai = N_matrix_current[:, config.NUM_MICROSERVICES:]
+        delay_ai = QueueingEngine.calc_mm1_delay_tensor(lambda_ai, mu_ai, c_ai)
+
+        # 拼接全网节点延迟矩阵
+        node_delays = np.concatenate((delay_micro, delay_ai), axis=1)
+
+        # D. 排队论引擎计算通信延迟与端到端延迟
+        comm_delays = QueueingEngine.calc_comm_delay_matrix(traffic_bytes, self.physical_net)
+        end_to_end_delays = QueueingEngine.calculate_end_to_end_delay(
+            self.traffic_gen, P_tensor, node_delays, comm_delays
+        )
+
+        # E. 多目标 Reward 结算
+        utilization = self.physical_net.get_utilization_matrix()
+        reward, info = self.reward_evaluator.evaluate_step_reward(
+            end_to_end_delays, utilization, N_matrix_current, self.current_distribution
+        )
+
+        # ===============================================================
+
+        # 同步系统状态留待下一回合
+        self.current_distribution = np.copy(N_matrix_current) 
         
         obs = {
-            "macro_node_features": self.physical_net.get_utilization_matrix(),  # 更新后的节点资源利用率矩阵
-            "macro_edge_features": np.copy(self.physical_net.edge_features),  # 边特征保持不变
-            "micro_service_distribution": np.copy(self.current_distribution)  # 更新后的服务分布矩阵
+            "macro_node_features": utilization,  
+            "macro_edge_features": np.copy(self.physical_net.edge_features),  
+            "micro_service_distribution": np.copy(self.current_distribution)  
         }
-
-        # 按照 Gymnasium 最新 API 规范，返回五元组：obs, reward, terminated, truncated, info
-        # 其中 truncated 是一个布尔值，表示回合是否由于达到最大步数限制而被截断，这里我们暂时设为 False，因为我们还没有实现步数限制的逻辑。
-        return obs, reward, terminated, False, info
+        # 正常执行完毕
+        return obs, reward, False, False, info

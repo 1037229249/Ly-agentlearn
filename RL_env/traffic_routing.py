@@ -154,7 +154,7 @@ class HeuristicRouter:
         lambda_agg = np.zeros((config.NUM_NODES, config.NUM_SERVICES), dtype=np.float32)
 
         # 记录跨节点通信流量张量 F \in R^{(S, V, V)} 
-        # F_tensor[s, i, j] 代表：为了执行服务 s，从节点 i 转发至节点 j 的流量强度 (req/s)，用于后续计算通信延迟和链路负载。
+        # F_tensor[s, i, j] 代表：为了执行服务  s，从节点 i 转发至节点 j 的流量强度 (req/s)，用于后续计算通信延迟和链路负载。
         F_tensor = np.zeros((config.NUM_SERVICES, config.NUM_NODES, config.NUM_NODES), dtype=np.float32)
 
         # 初始化物理链路数据传输负荷矩阵 (单位: MB/s)

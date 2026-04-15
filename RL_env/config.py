@@ -53,5 +53,33 @@ MAX_DATA_MB = 3.0          # 服务间传递的依赖数据量上限 (MB)
 
 # ================= 排队论与延迟惩罚配置 =================
 MAX_DELAY_MS = 10000.0  # 超过此延迟视为系统崩溃，给予极大负奖励
-MICROSERVICE_BASE_MU = 200.0  # 单个微服务实例的基准处理速率 (req/s)
-AI_SERVICE_BASE_MU = 20.0  # 单个AI服务实例的基准处理速率 (req/s)
+MICROSERVICE_MU_RANGE = (100.0, 300.0)  # 边缘节点微服务实例的处理速率范围 (req/s)
+AI_SERVICE_MU_RANGE = (10.0, 40.0)      # 边缘节点AI服务实例的处理速率范围 (req/s)
+
+# 云端算力倍乘系数（体现云端海量算力的碾压优势）
+CLOUD_MU_MULTIPLIER = 5000.0
+
+# ================= 多目标优化与奖励函数配置 =================
+# 优化目标权重 (\eta_1, \eta_2, \eta_3)
+ETA_DELAY = 0.5 # 延迟的惩罚权重
+ETA_VARIANCE = 0.2 # 负载均衡方差的惩罚权重
+ETA_COST = 0.3 # 部署成本的惩罚权重
+
+# 归一化极值基准 (用于将各维度压缩到 [0, 1] 之间，防止大数值吞噬小数值)
+MAX_NORM_DELAY = 2000.0   # 归一化基准延迟 (ms)
+MAX_NORM_VAR = 0.25 #归一化最大利用率方差(方差通常在 0~0.25 之间)
+MAX_NORM_COST = 100.0  # 归一化单步总成本
+
+# SLA (Service Level Agreement) 与 软约束惩罚
+TARGET_SLA_SUCCESS = 0.99 # 目标请求成功率 (99%)
+LAMBDA_SLA_PENALTY = 50.0 # 拉格朗日 SLA 违规惩罚乘子
+QOS_DELAY_TOLERANCE = 500.0 # 应用请求可容忍的最大延迟界限 (ms)，超过即算失败
+
+# AI 服务抖动惩罚 (Reward Shaping)
+OMEGA_SMOOTHNESS = 5.0 # AI 服务高频启停（防抖动）惩罚权重
+
+# 成本单价定义 (相对单位)
+COST_MICROSERVICE = 0.1   # 微服务单实例成本
+COST_AI_LIGHT = 2.0       # 轻量级 AI 单实例成本
+COST_AI_FULL = 10.0       # 全量级 AI 单实例成本
+COST_NODE_ACTIVE = 1.0    # 边缘节点激活(开机且托管了实例)的基础固定成本
