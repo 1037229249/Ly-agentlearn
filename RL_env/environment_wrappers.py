@@ -24,10 +24,14 @@ class DictObsNormalizationWrapper(gym.ObservationWrapper):
         # 经过归一化除法后，它会变成 np.float32 且值域变为 [0.0, 1.0]，必须显式更新 Space 定义，否则 Gym 的数据校验会报错
         self.observation_space = spaces.Dict({
             "macro_node_features": old_space["macro_node_features"],  # 利用率原本就在 [0, 1] 之间，保持不变
-            "macro_edge_features": old_space["macro_edge_features"],  # 待在 observation 方法中限制边界
+            "macro_edge_features": spaces.Box(
+                low=0.0, high=1.0, 
+                shape=(config.NUM_NODES, config.NUM_NODES, 2), 
+                dtype=np.float32
+            ),
             # shape指的是 micro_service_distribution 的矩阵维度，dtype 指定为 np.float32，low 和 high 分别指定了归一化后的值域范围
-            "micro_service_distribution": spaces.Box(
-                low=0.0, high=1.0, shape=old_space["micro_service_distribution"].shape, dtype=np.float32
+            "micro_service_state": spaces.Box(
+                low=0.0, high=1.0, shape=old_space["micro_service_state"].shape, dtype=np.float32
             )
         })
     
@@ -38,10 +42,16 @@ class DictObsNormalizationWrapper(gym.ObservationWrapper):
         # 1. 宏观节点特征：已经是 0-1 的利用率，直接透传
         node_features = obs["macro_node_features"]
 
-        # 2. 微观服务分布：[0, MAX_INSTANCES] -> [0.0, 1.0]
-        # 使用 astype 转换为 float32 防止整数除法引发的精度丢失
-        micro_dist = obs["micro_service_distribution"].astype(np.float32) / config.MAX_INSTANCES
-
+        # 处理微观供需状态
+        micro_state = obs["micro_service_state"].copy()
+        # 通道 0: 实例数归一化
+        micro_state[:, :, 0] = micro_state[:, :, 0] / config.MAX_INSTANCES
+        # 通道 1: 需求到达率归一化 (理论最大请求率 = 流量数 * 最大到达率)
+        max_possible_lambda = config.NUM_FLOWS * config.MAX_ARRIVAL_RATE
+        micro_state[:, :, 1] = np.tanh(micro_state[:, :, 1] / max_possible_lambda) # tanh 防御潮汐尖刺越界
+        
+        if np.any(micro_state < 0.0) or np.any(micro_state > 1.0):
+            raise ValueError("数据流异常：微观服务分布张量归一化后发生越界！")
         # 3. 拓扑边特征：由于包含无穷大 (np.inf) 和绝对数值，需彻底清洗
         edge_features = obs["macro_edge_features"].copy()  # 先复制一份，避免修改原始环境的状态
 
@@ -56,18 +66,25 @@ class DictObsNormalizationWrapper(gym.ObservationWrapper):
             config.MAX_NORM_BANDWIDTH, 
             edge_features[:, :, 0]
         )
-        # 极值除法归一化，并用 clip 裁剪以防万一超过 1.0 的扰动
-        edge_features[:, :, 0] = np.clip(edge_features[:, :, 0] / config.MAX_NORM_BANDWIDTH, 0.0, 1.0)
 
-        # ---- 处理通道 1：延迟 (Latency) ----
-        # 物理拓扑中，云端到边缘的延迟可能达到 50ms。将其按设定上限进行归一化。
-        edge_features[:, :, 1] = np.clip(edge_features[:, :, 1] / config.MAX_NORM_LATENCY, 0.0, 1.0)
+        bw_norm = edge_features[:, :, 0] / config.MAX_NORM_BANDWIDTH
+        lat_norm = edge_features[:, :, 1] / config.MAX_NORM_LATENCY
+        # 容忍 0.1% 的浮点误差，若超出则暴露底层参数设计 Bug
+        if np.any(bw_norm > 1.001) or np.any(lat_norm > 1.001):
+            raise ValueError(
+                f"归一化越界断言触发：底层环境的动态参数突破了预设常量！\n"
+                f"最大带宽归一化指标: {np.max(bw_norm):.4f}\n"
+                f"最大延迟归一化指标: {np.max(lat_norm):.4f}"
+            )
+        
+        edge_features[:, :, 0] = bw_norm
+        edge_features[:, :, 1] = lat_norm
 
         # 返回清洗后、纯洁的 [0, 1] 字典空间给智能体
         return {
             "macro_node_features": node_features,
             "macro_edge_features": edge_features,
-            "micro_service_distribution": micro_dist
+            "micro_service_state": micro_state,
         }
     
 class MaskableWrapper(gym.Wrapper):

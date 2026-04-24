@@ -27,6 +27,7 @@ class DynamicTrafficGenerator:
         随机生成具有逻辑依赖关系的服务调用链
         """
         self.active_flows = []
+        self.data_dep_matrix.fill(0.0)  # 重置数据依赖矩阵
         for f in range(self.num_flows):
             # 随机决定该流的链条长度
             chain_length = np.random.randint(config.MIN_CHAIN_LENGTH, config.MAX_CHAIN_LENGTH + 1)
@@ -44,16 +45,30 @@ class DynamicTrafficGenerator:
             # 随机指定流的初始接入边缘节点（排除拥有海量资源的云节点 0）
             start_node = np.random.randint(1, config.NUM_NODES)
 
-            # 泊松分布生成初始最大到达率
-            # np.random.poisson(lam) 用于生成一个服从泊松分布的随机数，其中 lam 是泊松分布的参数，表示单位时间内事件发生的平均次数。
-            # MAX_ARRIVAL_RATE / 2.0 是为了让初始到达率在最大值的一半左右，增加环境的挑战性和动态性。
-            initial_lambda = np.random.poisson(config.MAX_ARRIVAL_RATE / 2.0)
+            # ================= 真实物理潮汐参数初始化 =================
+            # 1. 基准到达率 (Base Lambda): 后续可修改此参数做不同流量压力的对比实验
+            base_lambda = np.random.uniform(config.MAX_ARRIVAL_RATE * 0.4, config.MAX_ARRIVAL_RATE * 0.6)
+            
+            # 2. 潮汐振幅 (Amplitude): 波动范围为基准的 20% ~ 40%
+            amplitude = np.random.uniform(0.2 * base_lambda, 0.4 * base_lambda)
+            
+            # 3. 随机相位 (Phase Shift): [0, 2pi)
+            phase_shift = np.random.uniform(0, 2 * np.pi)
+
+            # 4. 严格的泊松采样作为初始流量
+            initial_expected = base_lambda + amplitude * np.sin(phase_shift)
+            initial_lambda = np.random.poisson(max(10.0, initial_expected))
+
+            self._init_data_dependencies()
 
             # 将生成的流信息记录在 active_flows 列表中，供环境后续使用
             self.active_flows.append({
                 'flow_id': f,
                 'chain': chain,
                 'start_node': start_node,
+                'base_lambda': base_lambda,  # 记录该流的基准参数
+                'amplitude': amplitude,
+                'phase_shift': phase_shift,
                 'lambda': float(initial_lambda)
             })
     
@@ -66,20 +81,24 @@ class DynamicTrafficGenerator:
                 s_p = chain[i]
                 s_q = chain[i + 1]
                 if self.data_dep_matrix[s_p, s_q] == 0:
-                    # 随机分配 1~10 MB 的数据依赖量
-                    self.data_dep_matrix[s_p, s_q] = np.random.uniform(1.0, config.MAX_DATA_MB)
+                    # 在极小范围内波动
+                    self.data_dep_matrix[s_p, s_q] = np.random.uniform(0.01, config.MAX_DATA_MB)
         
-    def step_traffic(self):
+    def step_traffic(self, current_step):
         """
-        模拟潮汐效应，更新请求到达率。
-        在仿真的不同时间步调用，使网络处于动态波动中。
+        模拟真实世界的非齐次泊松过程 (NHPP)。
+        周期 T=128，与 max_steps_per_episode 完美对齐。
         """
+        T = 128.0 
         for flow in self.active_flows:
-            # 加入随机游走噪音
-            delta = np.random.normal(0, 50.0)
-            new_lambda = flow['lambda'] + delta
-            # 防止到达率突破上下限
-            flow['lambda'] = np.clip(new_lambda, 10.0, config.MAX_ARRIVAL_RATE)
+            # 1. 计算宏观潮汐期望值 (加入随机相位)
+            expected_lambda = flow['base_lambda'] + flow['amplitude'] * np.sin(2 * np.pi * current_step / T + flow['phase_shift'])
+            
+            # 2. 微观真实的泊松采样
+            actual_lambda = np.random.poisson(max(10.0, expected_lambda))
+
+            # 3. 物理截断防护
+            flow['lambda'] = np.clip(float(actual_lambda), 10.0, config.MAX_ARRIVAL_RATE)
 
 class HeuristicRouter:
     """
@@ -100,14 +119,16 @@ class HeuristicRouter:
         # ================= 1. 计算能力权重张量 (Capacity Preference) =================
         # 统计每个服务在全网的实例总数 N_sum，形状 (S,)
         N_sum = N_matrix.sum(axis=0)
-        # 防止除零异常
-        # np.where(condition, x, y) 函数的作用是根据 condition 条件返回 x 或 y 中的元素。
-        N_sum_safe = np.where(N_sum == 0, 1e-9, N_sum)
         # C_matrix[j, s] 表示节点 j 拥有的服务 s 实例数占比，形状 (V, S)
         # N_matrix含义是每个节点 i 上部署的服务 s 的实例数量，形状 (V, S)
         # N _sum_safe 是每个服务在全网的实例总数，形状 (S,)
         # 通过广播机制，N_sum_safe 会自动扩展为 (1, S)，使得每个节点 j 的服务 s 实例占比正确计算。
-        C_matrix = N_matrix / N_sum_safe
+        # 当 N_sum 为 0 时，除法不执行，结果直接保留 out 矩阵的默认值 0.0
+        # divide 函数的 out 参数指定了当 condition 条件为 False 时，输出结果应该是什么。
+        # 这里我们设置为一个全零矩阵，表示当某个服务在全网没有任何实例时，该服务在所有节点上的能力权重都为 0。
+        C_matrix = np.divide(N_matrix, N_sum, 
+                            out=np.zeros_like(N_matrix, dtype=np.float32), 
+                            where=N_sum != 0)
         # 将其转置并增加维度，升维广播至 (S, 1, V)，使得来源节点 i 的维度共享同一权重
         # 转置是为了后续计算中，服务 s 的维度能够正确对齐到第一维，方便与延迟矩阵进行加权组合。延迟矩阵的维度是 (V, V)，其中第一维是来源节点 i，第二维是目标节点 j。
         # 增加维度是为了在后续计算中，能够利用广播机制将节点 j 的能力权重正确应用到所有来源节点 i 上。
@@ -130,9 +151,9 @@ class HeuristicRouter:
 
         # 对目标节点 j (axis=2) 求和，计算归一化分母，形状 (S, V, 1)
         Denom = Num.sum(axis=2, keepdims=True)
-        # 防止除零异常
-        Denom_safe = np.where(Denom == 0, 1e-9, Denom)
-        L_tensor = Num / Denom_safe # 形状 (S, V, V)
+        L_tensor = np.divide(Num, Denom, 
+                     out=np.zeros_like(Num, dtype=np.float32), 
+                     where=Denom != 0)
 
         # ================= 3. 加权融合与物理常识拦截 =================
         P_tensor = self.alpha * C_tensor + (1 - self.alpha) * L_tensor

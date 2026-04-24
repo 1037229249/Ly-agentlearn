@@ -29,7 +29,7 @@ def run_test():
     N_matrix[2, :] = 1
 
     # 执行微观时间尺度路由推演
-    lambda_agg, F_tensor, P_tensor = router.step_route(N_matrix, generator)
+    lambda_agg, F_tensor, traffic_bytes_tensor, P_tensor = router.step_route(N_matrix, generator)
 
     # ================= 3. Burke 定理流量守恒断言 =================
     print("\n--- 正在验证网络内部流量守恒定理 ---")

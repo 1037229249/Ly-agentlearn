@@ -8,73 +8,98 @@ import numpy as np
 # 从 scipy 库中导入泊松分布的累积分布函数 (CDF)，用于计算请求到达率的概率分布
 from scipy.stats import poisson
 # 从 scipy 库中导入 gammaln 函数，用于计算阶乘的对数值，避免大数阶乘导致的数值溢出
-from scipy.special import gammaln
+from scipy.special import gammaln, pdtr
 import config
 
 class QueueingEngine:
     @staticmethod
     #@staticmethod 装饰器表示该方法是一个静态方法，可以直接通过类名调用，而不需要实例化对象。
-    def calc_mmc_delay_tensor(Lamda, Mu, C):
+    def calc_mmc_delay_tensor(Lambda, Mu, C):
         """
         计算微服务 (M/M/c) 延迟矩阵。
         输入维度：Lambda, Mu, C 均为 (NUM_NODES, NUM_MICROSERVICES)
         """
         C_float = C.astype(np.float32)  # 将实例数矩阵转换为浮点数类型，便于后续计算
 
-        # 避免除零异常
-        Mu_safe = np.where(Mu == 0, 1e-9, Mu)  # 将处理速率为零的元素替换为一个非常小的数，防止除零错误
-        C_safe = np.where(C == 0, 1e-9, C_float) 
+       # 1. 物理常识断言
+        if np.any(Mu <= 0):
+            raise ValueError("异构算力异常：服务处理速率 Mu 必须严格大于 0！")
+        if np.any(Lambda < 0):
+            raise ValueError("流量异常：到达率 Lambda 不能为负数！")
+        
+        # 2. 物理三态解析
+        # 状态 A：绝对静止（没有流量，延迟必定为 0.0）
+        mask_zero_traffic = (Lambda == 0.0)
 
-        # Rho代表服务强度，即请求到达率与处理能力的比值，计算公式为 Rho = (Lambda / Mu) / C
-        A = Lamda / Mu_safe  
-        Rho = A / C_safe  
+        # 状态 B：系统宕机与雪崩（有流量但没实例，或流量击穿算力上限）
+        # 安全张量除法：A = Lambda / Mu
+        A = np.divide(Lambda, Mu, out=np.zeros_like(Lambda), where=(Mu > 0))
+        # 安全计算利用率 Rho
+        Rho = np.divide(A, C_float, out=np.zeros_like(A), where=(C_float > 0))
+        mask_overload = (Lambda > 0.0) & ((C == 0) | (Rho >= 1.0))
 
-        # 识别超载或者无实例的非法区域
-        mask_overload = (Rho >= 1.0) | (C == 0)  # 当服务强度大于等于1或实例数为0时，系统处于过载状态
-        # 隔离合法数据区域，防止非法数据在scipy函数中引发数值错误
-        A_valid = np.where(mask_overload, 1e-9, A)
-        C_valid = np.where(mask_overload, 1, C_float)
-        Rho_valid = np.where(mask_overload, 0.5, Rho)
+        # 状态 C：合法排队稳态
+        mask_valid = ~(mask_zero_traffic | mask_overload)
+
+        # 3. 稳态运算安全区隔离 (填入 dummy variables 防止 numpy 底层 math domain error)
+        A_valid = np.where(mask_valid, A, 1.0)
+        C_valid = np.where(mask_valid, C_float, 1.0)
+        Rho_valid = np.where(mask_valid, Rho, 0.5)
 
         # 对数空间 Erlang C 概率推导 (消除 c! 溢出)
         cdf = poisson.cdf(C_valid - 1, A_valid)  # 计算泊松分布的累积分布函数，参数为 C_valid - 1 和 A_valid
         cdf_safe = np.where(cdf == 0, 1e-30, cdf)  # 防止累积概率为零导致的数值问题
 
-        log_term = A_valid + np.log(cdf_safe) + gammaln(C_valid + 1) - C_valid * np.log(A_valid + 1e-9)
+        log_term = A_valid + np.log(cdf_safe) + gammaln(C_valid + 1) - C_valid * np.log(A_valid)
         term = np.exp(log_term)  # 将对数空间的计算结果转换回正常空间
 
         # 计算多服务台繁忙概率Pc
         Pc = 1.0 / (term * (1.0 - Rho_valid) + 1.0)
 
-        # Erlang C 期望延迟
-        delay = Pc / (C_valid * Mu_safe - Lamda) + 1.0 / Mu_safe
+       # 稳态 Erlang C 期望延迟
+        denominator = np.maximum(C_valid * Mu - Lambda, 1e-5) # 防止除零
+        expected_delay = Pc / denominator + 1.0 / Mu
 
-        # 将非法区域的延迟设置为一个非常大的数，表示系统崩溃
-        return np.where(mask_overload, config.MAX_DELAY_MS, delay)
+        # 4. 物理最终结果组装
+        final_delay = np.zeros_like(Lambda, dtype=np.float32)
+        final_delay[mask_overload] = config.MAX_DELAY_MS
+        final_delay[mask_valid] = expected_delay[mask_valid]
+
+        return final_delay
 
     @staticmethod
-    def calc_mm1_delay_tensor(Lamda, Mu, C):
+    def calc_mm1_delay_tensor(Lambda, Mu, C):
         """
         计算 AI 服务 (M/M/1) 批处理延迟矩阵。
         输入维度：Lambda, Mu, C 均为 (NUM_NODES, NUM_AI_SERVICES)
         """
         C_float = C.astype(np.float32)  # 将实例数矩阵转换为浮点数类型，便于后续计算
-        # 避免除零异常
-        C_safe = np.where(C == 0, 1e-9, C_float)
 
-        # 请求均匀分布到每个实例上，计算每个实例的请求到达率
-        lambda_inst = Lamda / C_safe  # 每个实例的请求到达率
+        if np.any(Mu <= 0):
+            raise ValueError("异构算力异常：服务处理速率 Mu 必须严格大于 0！")
 
-        # 稳定性约束
-        mask_overload = (lambda_inst >= Mu) | (C == 0)  # 当每个实例的请求到达率大于等于处理速率或实例数为0时，系统处于过载状态
+        # 物理三态解析
+        mask_zero_traffic = (Lambda == 0.0)
 
-        Mu_safe = np.where(mask_overload, 1, Mu)
-        lambda_inst_safe = np.where(mask_overload, 0.0, lambda_inst) 
+        # 每个实例分摊的到达率
+        lambda_inst = np.divide(Lambda, C_float, out=np.zeros_like(Lambda), where=(C_float > 0))
+        mask_overload = (Lambda > 0.0) & ((C == 0) | (lambda_inst >= Mu))
+        mask_valid = ~(mask_zero_traffic | mask_overload)
 
-        # M/M/1 期望延迟计算公式：D = 1 / (Mu - lambda_inst)
-        delay = 1.0 / (Mu_safe - lambda_inst_safe)
-        # where 作用：当 mask_overload 条件为 True 时，返回 config.MAX_DELAY_MS；否则返回计算得到的 delay 值。这确保了在系统过载或无实例的情况下，延迟被设置为一个非常大的数，表示系统崩溃。
-        return np.where(mask_overload, config.MAX_DELAY_MS, delay)  
+        # 安全计算区
+        lambda_inst_valid = np.where(mask_valid, lambda_inst, 0.0)
+        Mu_valid = np.where(mask_valid, Mu, 1.0)
+        
+        # M/M/1 期望延迟计算公式
+        expected_delay = 1.0 / (Mu_valid - lambda_inst_valid)
+
+        # 物理组装
+        final_delay = np.zeros_like(Lambda, dtype=np.float32)
+        final_delay[mask_overload] = config.MAX_DELAY_MS
+        final_delay[mask_valid] = expected_delay[mask_valid]
+
+        return final_delay
+        
     
     @staticmethod
     # 参数说明：traffic_bytes_tensor 是一个形状为 (NUM_NODES, NUM_NODES) 的张量，表示每对节点之间的流量大小（以字节为单位）。
@@ -86,7 +111,18 @@ class QueueingEngine:
 
         # 简化计算：MB * 8 / Mbps = 秒 -> 换算为 ms
         # 实际工程中需注意单位：1 MB = 8 Mbits
-        transmission_delay = (traffic_bytes_tensor * 8.0) / np.where(B_matrix == 0, 1e-9, B_matrix)
+        # 1. 物理越界断言 (带宽断开但流量堆积)
+        if np.any((B_matrix == 0) & (traffic_bytes_tensor > 0)):
+            raise ValueError("物理路由越界：尝试在带宽为 0 的断开链路上进行数据传输！")
+
+        # 安全除法：零流量时传输延迟严格为 0
+        transmission_delay = np.divide(
+            traffic_bytes_tensor * 8.0, 
+            B_matrix, 
+            out=np.zeros_like(traffic_bytes_tensor), 
+            where=(B_matrix > 0)
+        )
+
         return transmission_delay + D_matrix
 
     @staticmethod

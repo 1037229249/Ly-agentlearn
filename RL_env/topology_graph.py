@@ -78,11 +78,17 @@ class PhysicalNetworkGraph:
         计算并输出节点维度的资源利用率矩阵 U_t。
         计算逻辑：(总容量 - 剩余容量) / 总容量，输出形状 (NUM_NODES, 3)，值域 [0, 1]。
         """
-        comsumed = self.capacity_matrix - self.remain_matrix
-        # 防止除零异常,clip函数用于将输入数组中的元素限制在指定的最小值和最大值之间，这里将利用率限制在0.0到1.0之间
-        #如果超出范围则会被截断为边界值，确保输出的利用率矩阵中的每个元素都在0.0到1.0之间，避免出现负数或大于1的值。
-        utilization = np.clip(comsumed / (self.capacity_matrix + 1e-9), 0.0, 1.0)
-        if np.any(utilization < 0.0) or np.any(utilization > 1.0):
-            raise ValueError("利用率超过[0, 1]范围，可能存在计算错误，请检查 capacity_matrix 和 remain_matrix 的值。")
-        #astype(np.float32)确保输出矩阵的数据类型为 float32，以节省内存并提高计算效率
+        consumed = self.capacity_matrix - self.remain_matrix
+        # np.divide 函数用于执行元素级的除法运算，参数 out 指定了输出数组，where 参数指定了在哪些位置执行除法运算。
+        utilization = np.divide(
+            consumed, 
+            self.capacity_matrix, 
+            out=np.zeros_like(consumed), 
+            where=(self.capacity_matrix > 0)
+        )
+            
+        # 严格的边界断言，容忍 1e-5 的浮点误差
+        if np.any(utilization < -1e-5) or np.any(utilization > 1.0 + 1e-5):
+            raise ValueError(f"物理越界：资源利用率超出 [0, 1] 范围！最大值: {np.max(utilization)}")
+
         return utilization.astype(np.float32)

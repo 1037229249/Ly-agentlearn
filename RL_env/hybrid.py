@@ -48,7 +48,7 @@ class HybridOrchestrationEnv(gym.Env):
                 shape=(config.NUM_NODES, 3), 
                 dtype=np.float32
             ),
-            # 宏观边特征：包含带宽与延迟的双通道张量 (NUM_NODES, NUM_NODES, 2)
+            # 宏观边特征：包含带宽、延迟的三通道张量 (NUM_NODES, NUM_NODES, 2)
             "macro_edge_features": spaces.Box(
                 low=0.0, 
                 high=np.inf, 
@@ -56,10 +56,13 @@ class HybridOrchestrationEnv(gym.Env):
                 dtype=np.float32
             ),
             # 微观服务分布：精准记录各类服务在不同节点上的实例数分布矩阵 (NUM_NODES, NUM_SERVICES)
-            "micro_service_distribution": spaces.Box(
+            # 核心微观状态：(NUM_NODES, NUM_SERVICES, 2)
+            # 通道 0: 实例分布 (供给)
+            # 通道 1: 聚合请求率 (需求)
+            "micro_service_state": spaces.Box(
                 low=0, 
                 high=config.MAX_INSTANCES, 
-                shape=(config.NUM_NODES, config.NUM_SERVICES), 
+                shape=(config.NUM_NODES, config.NUM_SERVICES, 2), 
                 dtype=np.int32
             )
         })
@@ -103,6 +106,25 @@ class HybridOrchestrationEnv(gym.Env):
         self.Mu_matrix[0, :config.NUM_MICROSERVICES] = config.MICROSERVICE_MU_RANGE[1] * config.CLOUD_MU_MULTIPLIER
         self.Mu_matrix[0, config.NUM_MICROSERVICES:] = config.AI_SERVICE_MU_RANGE[1] * config.CLOUD_MU_MULTIPLIER
 
+        # ======= 回合时间步计数器 =======
+        self.current_step = 0
+        self.max_steps_per_episode = 128  # 定义一个回合运行多少个宏观时间步
+        # 记录上一帧请求需求的变量
+        self.last_lambda_agg = np.zeros((config.NUM_NODES, config.NUM_SERVICES), dtype=np.float32)
+
+    def _get_obs(self):
+        # 组装 供需双通道状态
+        # np.stack 将两个 (N, S) 矩阵在最后的维度拼接成 (N, S, 2)
+        micro_state = np.stack(
+            (self.current_distribution.astype(np.float32), self.last_lambda_agg), 
+            axis=-1
+        )
+        return {
+            "macro_node_features": self.physical_net.get_utilization_matrix(),
+            "macro_edge_features": np.copy(self.physical_net.edge_features), 
+            "micro_service_state": micro_state
+        }
+
     def reset(self, seed=None, options=None):
         """
         这里reset方法是Gym环境中的一个重要方法，用于将环境重置到初始状态，准备开始一个新的Episode。
@@ -117,6 +139,10 @@ class HybridOrchestrationEnv(gym.Env):
         self.physical_net.reset_topology()
         # 清空全网所有的实例部署
         self.current_distribution.fill(0)
+        # ======= 重置时间步 =======
+        self.current_step = 0
+
+        self.last_lambda_agg.fill(0)
 
         # 重置流量链
         self.traffic_gen._generate_service_chains()
@@ -131,16 +157,8 @@ class HybridOrchestrationEnv(gym.Env):
             config.AI_SERVICE_MU_RANGE[0], config.AI_SERVICE_MU_RANGE[1], 
             size=(config.NUM_NODES - 1, config.NUM_AI_SERVICES)
         )
-
-        # 构建符合 observation_space 定义的状态字典
-        obs = {
-            "macro_node_features": self.physical_net.get_utilization_matrix(),  # 当前节点资源利用率矩阵 (NUM_NODES, 3)
-            "macro_edge_features": np.copy(self.physical_net.edge_features),  # 当前边特征张量 (NUM_NODES, NUM_NODES, 2)
-            "micro_service_distribution": np.copy(self.current_distribution)  # 当前服务分布矩阵 (NUM_NODES, NUM_SERVICES)
-        }
-        # 返回状态 obs 和一个空的 info 字典（预留给后续记录方差、成本等额外指标）
-        info = {}
-        return obs, info
+        
+        return self._get_obs(), {}
     
     def action_masks(self):
         """
@@ -152,29 +170,28 @@ class HybridOrchestrationEnv(gym.Env):
         # np.ones 函数的作用是创建一个指定形状的数组，并用 1 填充。
         # 这里创建了一个形状为 (NUM_NODES, NUM_SERVICES, DEPLOY_ACTION_DIM) 的三维数组，所有元素都被初始化为 1（即 True），表示初始状态下所有动作都是合法的。
         mask = np.ones((config.NUM_NODES, config.NUM_SERVICES, config.DEPLOY_ACTION_DIM), dtype=bool)
-        # 遍历每个节点和服务，检查每种动作的合法性
+        # ----- 动作 0: 缩容 (-1) -----
+        # 限制：如果当前实例数小于等于 0，则禁止再缩容
+        mask[:, :, 0] = self.current_distribution > 0  # 只有当实例数大于0时，缩容动作才合法
+        # ----- 动作 1: 保持 (0) -----
+        # 限制：保持动作通常总是合法的，因为它不改变部署状态，所以这里不做特殊处理，保持为 True。
+        # ----- 动作 2: 扩容 (+1) -----
+        # 限制 A: 如果当前实例数已经达到单节点最大实例数上限，则禁止扩容
+        # 2: 扩容限制 A (实例上限)
+        mask[:, :, 2] = self.current_distribution < config.MAX_INSTANCES
+        # 限制 B: 物理剩余资源必须能够容纳该服务单实例的资源需求
+        # 2: 扩容限制 B (物理资源校验 - 向量化)
+        # remain_matrix: (N, 3), req_matrix: (S, 3)
+        # 这里用广播机制检查资源是否足够
         for n in range(config.NUM_NODES):
-            for s in range(config.NUM_SERVICES):
-                current_instances = self.current_distribution[n, s]
-                req = self.service_registry.service_req_matrix[s]  # 获取服务 s 的资源需求向量 [CPU, GPU, MEM]
-                # ----- 动作 0: 缩容 (-1) -----
-                # 限制：如果当前实例数小于等于 0，则禁止再缩容
-                if current_instances <= 0:
-                    mask[n, s, 0] = False  # 禁止缩容动作
-                # ----- 动作 1: 保持 (0) -----
-                # 限制：保持动作通常总是合法的，因为它不改变部署状态，所以这里不做特殊处理，保持为 True。
-                # ----- 动作 2: 扩容 (+1) -----
-                # 限制 A: 如果当前实例数已经达到单节点最大实例数上限，则禁止扩容
-                if current_instances >= config.MAX_INSTANCES:
-                    mask[n, s, 2] = False  # 禁止扩容动作
-                else:
-                    # 限制 B: 物理剩余资源必须能够容纳该服务单实例的资源需求
-                    if np.any(self.physical_net.remain_matrix[n] < req):
-                        mask[n, s, 2] = False  # 禁止扩容动作
-                    # 限制 C：架构限制(例如 Full-size AI 只能部署在云端 Node 0)
-                    # 假设 config.NUM_MICROSERVICES 对应的是第一个 AI 服务 (Full-size)
-                    if s == config.NUM_MICROSERVICES and n != 0:
-                        mask[n, s, 2] = False  # 禁止在非云节点扩容 Full-size AI 服务
+            # 将该节点的剩余资源与所有服务的需求对比
+            insufficient_resource = np.any(self.physical_net.remain_matrix[n] < self.service_registry.service_req_matrix, axis=1)
+            mask[n, insufficient_resource, 2] = False
+        # 限制 C：架构限制(例如 Full-size AI 只能部署在云端 Node 0)
+        # 假设 config.NUM_MICROSERVICES 对应的是第一个 AI 服务 (Full-size)
+        # 限制 C (AI 服务架构限制：假设 S-1 为全量AI，只能在节点0)
+        full_ai_idx = config.NUM_MICROSERVICES
+        mask[1:, full_ai_idx, 2] = False  # 屏蔽边缘节点的扩容
 
         # SB3 的 MaskablePPO 针对 MultiDiscrete 要求返回展开的 1D 布尔数组
         # mask 的原始形状是 (NUM_NODES, NUM_SERVICES, DEPLOY_ACTION_DIM)
@@ -186,45 +203,64 @@ class HybridOrchestrationEnv(gym.Env):
         """
         双时间尺度中的宏观时间步 (Macro-step Deploy)
         """
+         # ======= 推进时间步 =======
+        self.current_step += 1
+        # 判断是否达到了最大时间步（截断标志）
+        truncated = bool(self.current_step >= self.max_steps_per_episode)
+
         # 1. 动作解码：将 0/1/2 映射为真实的实例变动量 -1/0/+1
         # action 是长度为 N*S 的 1D 数组，转为 (N, S) 矩阵，再整体减 1
         action_matrix = action.reshape((config.NUM_NODES, config.NUM_SERVICES))
         delta_matrix = action_matrix - 1  # 将 0/1/2 转换为 -1/0/+1 的增减指令
         
-        # 2. 计算转移后的微观服务分布状态
-        N_matrix_current = self.current_distribution + delta_matrix  # 计算新的实例分布矩阵
+        # ================= 确定性动作校验与联合容量安全网 =================
+        truncated_action_count = 0 
+        valid_delta_matrix = np.zeros_like(delta_matrix)
 
-        # [安全网] 理论上有 Action Masking 不应发生越界，出现越界要报异常
-        if np.any(N_matrix_current < 0) or np.any(N_matrix_current > config.MAX_INSTANCES):
-            raise ValueError("Action leads to invalid instance count! Check action masking logic.")
-        
-        N_matrix_current = np.clip(N_matrix_current, 0, config.MAX_INSTANCES)  # 确保实例数在合法范围内
+        # 1. 缩容操作绝对物理合法，优先放行
+        shrink_mask = delta_matrix < 0
+        valid_delta_matrix[shrink_mask] = -1
+
+        # 2. 评估扩容操作 (获取全网准备扩容的位置)
+        expansion_mask = delta_matrix > 0
+
+        # 3. 计算如果不扩容时的资源占用基础 (全网矩阵一次性计算)
+        N_after_shrink = self.current_distribution + valid_delta_matrix
+        base_consumed = np.dot(N_after_shrink, self.service_registry.service_req_matrix)
+
+        # 4. 计算扩容动作的总资源渴求 (全网扩容遮罩 点乘 需求矩阵)
+        demand_req = np.dot(expansion_mask.astype(np.float32), self.service_registry.service_req_matrix)
+
+        # 5. 投影总消耗并找出越界节点
+        projected_consumed = base_consumed + demand_req
+        over_limit_nodes = np.any(projected_consumed > self.physical_net.capacity_matrix, axis=1) # (NUM_NODES,)
+
+        # 6. 计算被截断的扩容动作数量
+        truncated_action_count = np.sum(expansion_mask[over_limit_nodes])
+
+        # 7. 过滤出合法的节点，并将其扩容动作放行
+        valid_nodes = ~over_limit_nodes
+        valid_expansion_mask = expansion_mask & valid_nodes[:, np.newaxis]
+        valid_delta_matrix[valid_expansion_mask] = 1
+
+        #  使用严格校验后的有效矩阵进行状态转移
+        N_matrix_current = self.current_distribution + valid_delta_matrix
 
         # 3. 矩阵化资源计算 (运用 Einsum 或 dot 实现高维张量乘法)
         # N_matrix (Nodes, Services) 点乘 service_req_matrix (Services, 3) -> (Nodes, 3)
         # 具体理解：N_matrix 中的每个元素 N_matrix[n, s] 表示节点 n 上服务 s 的实例数量，service_req_matrix 中的每行表示一个服务的资源需求向量 [CPU, GPU, MEM]。
-        consumed_resources = np.dot(N_matrix_current, self.service_registry.service_req_matrix) 
-
-        # 硬件约束严密校验
-        is_invalid_action = np.any(consumed_resources > self.physical_net.remain_matrix)
-
-        if is_invalid_action:
-            # 越界惩罚
-            obs = {
-                "macro_node_features": self.physical_net.get_utilization_matrix(),  # 更新后的节点资源利用率矩阵
-                "macro_edge_features": np.copy(self.physical_net.edge_features),  # 边特征保持不变
-                "micro_service_distribution": np.copy(self.current_distribution)  # 更新后的服务分布矩阵
-            }
-            return obs, config.INVALID_ACTION_PENALTY, True, False, {"error_msg": "Mask bypass!"}
+        consumed_resources = np.dot(N_matrix_current, self.service_registry.service_req_matrix) # 计算每个节点的总资源消耗
 
         # 更新物理基座状态
-        self.physical_net.remain_matrix = self.physical_net.capacity_matrix - consumed_resources  # 更新剩余资源矩阵
+        self.physical_net.remain_matrix = self.physical_net.capacity_matrix - consumed_resources
         # ================= 调用底层引擎链路 =================
         # A. 更新网络流量环境
-        self.traffic_gen.step_traffic()
+        self.traffic_gen.step_traffic(self.current_step)
 
         # B. 调用路由引擎推演分布
         lambda_agg, F_tensor, traffic_bytes, P_tensor = self.router.step_route(N_matrix_current, self.traffic_gen)
+
+        self.last_lambda_agg = lambda_agg  # 更新供需状态中的需求通道，供下一回合观察使用
 
         # C. 排队论引擎计算节点延迟 (区分微服务和AI服务)
         lambda_micro = lambda_agg[:, :config.NUM_MICROSERVICES]
@@ -249,7 +285,7 @@ class HybridOrchestrationEnv(gym.Env):
         # E. 多目标 Reward 结算
         utilization = self.physical_net.get_utilization_matrix()
         reward, info = self.reward_evaluator.evaluate_step_reward(
-            end_to_end_delays, utilization, N_matrix_current, self.current_distribution
+            end_to_end_delays, utilization, N_matrix_current, self.current_distribution, truncated_action_count
         )
 
         # ===============================================================
@@ -257,10 +293,5 @@ class HybridOrchestrationEnv(gym.Env):
         # 同步系统状态留待下一回合
         self.current_distribution = np.copy(N_matrix_current) 
         
-        obs = {
-            "macro_node_features": utilization,  
-            "macro_edge_features": np.copy(self.physical_net.edge_features),  
-            "micro_service_distribution": np.copy(self.current_distribution)  
-        }
         # 正常执行完毕
-        return obs, reward, False, False, info
+        return self._get_obs(), reward, False, truncated, info
